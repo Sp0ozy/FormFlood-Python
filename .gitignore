@@ -1,25 +1,8 @@
-﻿# Python
-backend/venv/
-backend/__pycache__/
-backend/**/__pycache__/
-backend/*.pyc
-backend/**/*.pyc
-backend/.env
-backend/*.egg-info/
-backend/.pytest_cache/
-backend/.mypy_cache/
-
-# Node / Next.js
-frontend/node_modules/
-frontend/.next/
-frontend/.env.local
-frontend/out/
-
-# General
 .env
-*.log
-.DS_Store
-Thumbs.db
-
-# Alembic
-backend/alembic/versions/*.pyc
+.env.local
+__pycache__/
+*.pyc
+.venv/
+venv/
+node_modules/
+.next/
