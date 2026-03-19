@@ -1,11 +1,14 @@
 {
+  "permissions": {
+    "allow": [
+      "mcp__filesystem__list_allowed_directories",
+      "Bash(\"C:/Users/Ilya/projects/formflood/backend/.env.example\":*)",
+      "Bash(venv/Scripts/pip install:*)",
+      "Bash(DATABASE_URL=\"postgresql+asyncpg://x:x@localhost/x\" REDIS_URL=\"redis://localhost\" SECRET_KEY=\"test\" venv/Scripts/python -c \"from app.main import app; print\\(''OK''\\)\")"
+    ]
+  },
   "enabledMcpjsonServers": [
     "filesystem",
     "postgres"
-  ],
-  "permissions": {
-    "allow": [
-      "mcp__filesystem__list_allowed_directories"
-    ]
-  }
+  ]
 }

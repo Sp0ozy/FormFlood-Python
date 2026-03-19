@@ -1,291 +1,233 @@
-﻿# FormFlood — Product Requirements Document
-# Python Stack (FastAPI + Celery + Redis + PostgreSQL + Next.js)
+# FormFlood — Product Requirements Document
+
+## What this is
+
+FormFlood is a SaaS tool for bulk-submitting responses to Google Forms.
+The user pastes a form URL, configures answers, clicks Submit —
+the app sends hundreds of forms in the background while they do something else.
 
 ---
 
-## 1. What this product is
+## Key architectural decisions and WHY
 
-FormFlood is a public SaaS web application that lets users bulk-generate and submit responses
-to Google Forms at scale. The user pastes a Google Form URL, the app parses all questions and
-their options, the user configures response distributions per question, sets a count and delay,
-and the app submits everything in the background via a job queue while showing live progress.
+### 1. Background task queue (Celery + Redis)
 
----
+**Problem:** sending 1000 forms = 1000 HTTP requests with delays.
+You can't keep the browser open, and you can't hold a single HTTP request open for 10+ minutes.
 
-## 2. Core user flow
+**Solution:** when the user hits Submit, the API creates a Job in the database
+and puts a task in the queue. A Celery worker picks it up and runs it
+independently of the browser.
 
-1. User signs up / logs in
-2. Pastes a Google Form URL
-3. App parses the form and shows all questions with their options
-4. User configures distribution per question (e.g. option A 60%, option B 40%)
-5. User sets total submission count and delay between submissions (ms)
-6. User clicks Submit — job is created and enqueued
-7. User is redirected to job progress page (polls every 3s)
-8. After completion, job appears in dashboard with stats
-9. User can re-run any past job with one click
+**Redis** is the broker: it holds the queue between the API and the worker.
+API puts task in → Redis holds it → worker picks it up.
 
----
-
-## 3. Tech stack
-
-| Layer            | Technology                        | Notes                                          |
-|------------------|-----------------------------------|------------------------------------------------|
-| API              | FastAPI                           | Async, typed, auto-generates OpenAPI docs      |
-| Job queue        | Celery + Redis                    | Async background submission workers            |
-| Database         | PostgreSQL                        | Via SQLAlchemy 2.0 (async) + Alembic migrations|
-| Auth             | FastAPI-Users                     | Email/password, JWT tokens                     |
-| HTTP client      | httpx                             | Async HTTP for form fetching and submitting    |
-| Frontend         | Next.js 14+ (App Router)          | React, TypeScript, Tailwind CSS                |
-| Frontend→API     | REST (JSON)                       | JWT in Authorization header                    |
-| Local dev        | Docker Compose                    | PostgreSQL + Redis + backend + worker + frontend|
-| Deployment       | TBD — optimise for local dev first|                                                |
+**Flow:**
+```
+Browser → POST /jobs → FastAPI creates Job in DB → puts task_id in Redis
+                                                        ↓
+                                              Celery worker picks it up
+                                              and submits forms
+```
 
 ---
 
-## 4. Project structure
+### 2. Progress stored in DB after every submission
 
-formflood/
-├── backend/
-│   ├── app/
-│   │   ├── main.py                  # FastAPI app entry point
-│   │   ├── config.py                # Settings via pydantic-settings (.env)
-│   │   ├── database.py              # Async SQLAlchemy engine + session
-│   │   ├── models/
-│   │   │   ├── user.py              # User model
-│   │   │   ├── job.py               # Job model
-│   │   │   └── submission.py        # Individual submission record
-│   │   ├── schemas/
-│   │   │   ├── job.py               # Pydantic request/response schemas
-│   │   │   └── form.py              # ParsedForm, ParsedQuestion schemas
-│   │   ├── routers/
-│   │   │   ├── forms.py             # POST /forms/parse
-│   │   │   └── jobs.py              # CRUD for jobs
-│   │   ├── services/
-│   │   │   ├── form_parser/
-│   │   │   │   ├── __init__.py
-│   │   │   │   ├── parser.py        # Fetch HTML, extract FB_PUBLIC_LOAD_DATA_, parse
-│   │   │   │   ├── types.py         # ParsedForm, ParsedQuestion, QuestionType enum
-│   │   │   │   └── handlers/        # Strategy pattern — one file per question type
-│   │   │   │       ├── base.py      # Abstract base handler
-│   │   │   │       ├── multiple_choice.py
-│   │   │   │       ├── checkbox.py
-│   │   │   │       ├── dropdown.py
-│   │   │   │       └── registry.py  # Maps QuestionType -> handler instance
-│   │   │   └── submission/
-│   │   │       ├── engine.py        # Builds payload, POSTs to /formResponse
-│   │   │       └── distribution.py  # Config + count -> shuffled response array
-│   │   ├── worker/
-│   │   │   ├── celery_app.py        # Celery instance + config
-│   │   │   └── tasks.py             # run_job task: reads DB, submits, updates progress
-│   │   └── auth/
-│   │       └── users.py             # FastAPI-Users setup
-│   ├── alembic/                     # DB migrations
-│   ├── tests/                       # pytest tests for parser + engine + distribution
-│   ├── requirements.txt
-│   ├── .env.example
-│   └── Dockerfile
-├── frontend/
-│   ├── src/
-│   │   ├── app/
-│   │   │   ├── (auth)/login/
-│   │   │   ├── (auth)/signup/
-│   │   │   ├── (dashboard)/dashboard/
-│   │   │   ├── (dashboard)/jobs/[id]/
-│   │   │   ├── new/                 # Form URL input + config wizard
-│   │   │   └── page.tsx             # Landing page
-│   │   └── lib/
-│   │       └── api.ts               # Typed fetch wrappers for all backend endpoints
-│   ├── package.json
-│   └── Dockerfile
-├── plans/                           # Task plans (delete after completion)
-├── docker-compose.yml
-├── CLAUDE.md
-└── PRD.md
+**Problem:** if the worker crashes on submission #347 out of 1000 — where do we resume?
+
+**Solution:** after each submission the worker writes to Job:
+`success_count += 1` or `fail_count += 1`. These are atomic updates in Postgres.
+
+On restart, the worker reads `success_count` from DB and resumes from position
+`success_count + fail_count`. The client sees live progress via polling every 3 seconds.
 
 ---
 
-## 5. Database models
+### 3. JWT authentication
+
+**Problem:** each user should only see their own jobs.
+
+**Solution:** on registration a User is created. On login a JWT token is issued
+(a signed string with user_id inside). Every API request sends this token
+in the `Authorization: Bearer <token>` header. The API decodes it and knows who is asking.
+
+**JWT is stateless** — the server never stores it, only verifies the signature with SECRET_KEY.
+
+---
+
+## Database: three tables
 
 ### User
-- id: UUID PK
-- email: str unique
-- hashed_password: str
-- is_active: bool default True
-- plan: str default "free"           # monetization hook, unused in v1
-- created_at: datetime
+Who uses the app.
+```
+id           UUID   — unique identifier
+email        str    — login
+password     str    — hashed (bcrypt, never plain text)
+plan         str    — "free" (monetization hook, unused in v1)
+created_at   datetime
+```
 
 ### Job
-- id: UUID PK
-- user_id: UUID FK -> User
-- status: enum [pending, running, completed, failed, cancelled]
-- form_url: str
-- form_title: str
-- total_count: int
-- success_count: int default 0
-- fail_count: int default 0
-- delay_ms: int default 1000         # delay between submissions
-- config: JSON                       # full response distribution config
-- celery_task_id: str nullable
-- created_at: datetime
-- started_at: datetime nullable
-- completed_at: datetime nullable
+One "job" = one bulk submission run.
+```
+id               UUID
+user_id          UUID → FK to User  (whose job)
+status           enum: pending | running | completed | failed | cancelled
+form_url         str   — URL of the form
+form_title       str   — title (parsed from the form)
+total_count      int   — how many to submit
+success_count    int   — how many succeeded (updated in real time)
+fail_count       int   — how many failed
+delay_ms         int   — pause between submissions (protection against bans)
+config           JSON  — response distribution per question
+celery_task_id   str   — Celery task ID (needed for cancellation)
+created_at       datetime
+started_at       datetime nullable
+completed_at     datetime nullable
+```
+
+**Why `config` as JSON?** The answer structure depends on the form — each form has
+different questions and options. Storing this in separate tables is complex;
+JSON is more flexible for this dynamic structure.
 
 ### Submission
-- id: UUID PK
-- job_id: UUID FK -> Job
-- status: enum [success, failed]
-- error_message: str nullable
-- submitted_at: datetime
+One row = one submitted form.
+```
+id             UUID
+job_id         UUID → FK to Job
+status         enum: success | failed
+error_message  str nullable — what went wrong
+submitted_at   datetime
+```
+
+**Why Submission if Job already has counters?**
+Counters give aggregated stats (fast).
+Submission lets you inspect details — exactly when a specific submission failed,
+what error. Needed for debugging and detail views.
 
 ---
 
-## 6. API endpoints
+## API endpoints
 
 | Method | Path                  | Auth | Description                              |
 |--------|-----------------------|------|------------------------------------------|
 | POST   | /auth/register        | No   | Create account                           |
-| POST   | /auth/jwt/login       | No   | Login, returns JWT                       |
-| POST   | /forms/parse          | Yes  | Fetch + parse a Google Form URL          |
-| POST   | /jobs                 | Yes  | Create job + enqueue Celery task         |
-| GET    | /jobs                 | Yes  | List all jobs for current user (paginated)|
-| GET    | /jobs/{id}            | Yes  | Get job status + submission stats        |
+| POST   | /auth/login           | No   | Get JWT token                            |
+| POST   | /forms/parse          | Yes  | Parse a Google Form by URL               |
+| POST   | /jobs                 | Yes  | Create job and enqueue                   |
+| GET    | /jobs                 | Yes  | List current user's jobs                 |
+| GET    | /jobs/{id}            | Yes  | Status + progress of one job             |
 | PATCH  | /jobs/{id}/cancel     | Yes  | Cancel a running job                     |
 
-All error responses: {"detail": "message"} (FastAPI default) or {"error": str, "detail": any}
+---
+
+## How Google Forms parsing works
+
+Google Forms embeds all form data directly in the page HTML in a variable:
+```js
+FB_PUBLIC_LOAD_DATA_ = [[...huge array...]]
+```
+
+Algorithm:
+1. `httpx.get(url)` — download the form HTML
+2. `regex` — extract JSON from `FB_PUBLIC_LOAD_DATA_`
+3. `json.loads()` — parse it
+4. `data[1][1]` — list of questions
+5. Each question: `[entry_id, title, _, type_int, options]`
+   - `type_int == 2` → multiple choice
+   - `type_int == 3` → dropdown
+   - `type_int == 4` → checkbox
+
+Submission — plain POST:
+```
+POST https://docs.google.com/forms/d/e/{FORM_ID}/formResponse
+Content-Type: application/x-www-form-urlencoded
+Body: entry.123456=AnswerA&entry.789012=AnswerB
+```
 
 ---
 
-## 7. Google Form parsing — how it works
+## Stack
 
-Every Google Form HTML page contains a JavaScript variable:
-    FB_PUBLIC_LOAD_DATA_ = [...]
-
-Steps to parse:
-1. Fetch the form URL with httpx (add realistic User-Agent header)
-2. Extract FB_PUBLIC_LOAD_DATA_ value from raw HTML via regex
-3. json.loads() the extracted string
-4. Navigate to data[1][1] — this is the list of question objects
-5. Each question: [entry_id, title, _, question_type_int, options_data, ...]
-6. Map question_type_int to QuestionType enum:
-   - 2 = MULTIPLE_CHOICE
-   - 4 = CHECKBOX
-   - 3 = DROPDOWN
-
-Submission endpoint:
-    POST https://docs.google.com/forms/d/e/{FORM_ID}/formResponse
-    Content-Type: application/x-www-form-urlencoded
-
-Payload keys: entry.XXXXXXX (the entry_id for each question)
-Checkboxes: append multiple values under the same key (use list in httpx data param)
+| Layer      | Technology                          | Why this choice                  |
+|------------|-------------------------------------|----------------------------------|
+| API        | FastAPI (async Python)              | Fast, typed, async-native        |
+| Queue      | Celery + Redis                      | Industry standard for bg tasks   |
+| DB         | PostgreSQL + SQLAlchemy 2.0 async   | Reliable relational DB           |
+| Migrations | Alembic                             | DB schema versioning             |
+| Auth       | FastAPI-Users + JWT                 | Ready solution, not reinvented   |
+| HTTP       | httpx (async)                       | Async HTTP client                |
+| Frontend   | Next.js 14 + TypeScript + Tailwind  | App Router, server components    |
+| Dev env    | Docker Compose                      | Postgres + Redis locally         |
 
 ---
 
-## 8. Question handler interface (strategy pattern)
+## Project structure
 
-Every handler in services/form_parser/handlers/ implements:
-
-class BaseHandler(ABC):
-    def parse_options(self, raw_data: list) -> list[str]: ...
-    def generate_responses(self, config: dict, count: int) -> list[str | list[str]]: ...
-    def format_payload(self, entry_id: str, value: str | list[str]) -> dict: ...
-
-Adding a new question type = implement this ABC + register in registry.py.
-Do NOT touch parser.py or engine.py when adding a type.
-
----
-
-## 9. Celery worker — job execution flow
-
-1. Task receives job_id
-2. Load job from DB, set status = running, started_at = now
-3. Reconstruct response array: distribution.generate(job.config, job.total_count)
-4. Shuffle the response array
-5. For each response set:
-   a. Build URL-encoded payload via engine.build_payload()
-   b. POST to formResponse endpoint with httpx
-   c. On success: increment success_count, insert Submission(status=success)
-   d. On failure: increment fail_count, insert Submission(status=failed, error=...)
-   e. Update job in DB after each submission (for live progress polling)
-   f. Check if job.status == cancelled — if yes, break loop
-   g. Sleep delay_ms / 1000 seconds
-6. Set status = completed (or failed if all failed), completed_at = now
-
----
-
-## 10. Frontend pages
-
-### Landing page (/)
-- If logged in: redirect to /dashboard
-- If not: headline "Fill Google Forms at Scale", two CTAs (Sign up / Log in)
-- 3 feature cards: Parse Any Form, Custom Distributions, Run in Background
-
-### Auth pages (/login, /signup)
-- Email + password forms
-- JWT stored in httpOnly cookie or localStorage (decide during build)
-- Forgot password: stub (show "coming soon" message)
-
-### New job wizard (/new)
-- Step 1: URL input + Parse button
-- Step 2: Per-question distribution config (sliders or % inputs per option)
-- Step 3: Count + delay settings + Submit button
-
-### Job progress page (/jobs/[id])
-- Polls GET /jobs/{id} every 3 seconds
-- Shows: status badge, progress bar (success_count / total_count), fail count
-- Cancel button (only when status = running)
-- Auto-stops polling when status = completed | failed | cancelled
-
-### Dashboard (/dashboard)
-- Table of all jobs: form title, status, count, success/fail, created date
-- Re-run button: creates new job with same config
-- Pagination: 20 per page
+```
+formflood/
+├── backend/
+│   ├── app/
+│   │   ├── main.py          — FastAPI entry point, router registration
+│   │   ├── config.py        — all settings from .env via pydantic-settings
+│   │   ├── database.py      — async SQLAlchemy engine, session dependency
+│   │   ├── models/          — ORM models (User, Job, Submission)
+│   │   ├── schemas/         — Pydantic request/response schemas
+│   │   ├── routers/         — HTTP routes (forms.py, jobs.py)
+│   │   ├── services/
+│   │   │   ├── form_parser/ — Google Forms parsing (parser + handlers)
+│   │   │   └── submission/  — form submission (engine + distribution)
+│   │   ├── worker/
+│   │   │   ├── celery_app.py — Celery initialization
+│   │   │   └── tasks.py      — run_job task
+│   │   └── auth/
+│   │       └── users.py     — FastAPI-Users config
+│   ├── alembic/             — DB migrations
+│   ├── tests/               — pytest tests
+│   └── requirements.txt
+├── frontend/
+│   └── src/app/             — Next.js pages
+├── docker-compose.yml       — Postgres + Redis + backend + worker + frontend
+├── PRD.md                   — this file
+└── CLAUDE.md                — rules for Claude Code
+```
 
 ---
 
-## 11. Environment variables
+## Build order (step by step)
 
-# backend/.env
-DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/formflood_dev
-REDIS_URL=redis://localhost:6379/0
-SECRET_KEY=change-this-to-random-string
-ALGORITHM=HS256
-ACCESS_TOKEN_EXPIRE_MINUTES=60
-
-# frontend/.env.local
-NEXT_PUBLIC_API_URL=http://localhost:8000
-
----
-
-## 12. Local dev setup (Docker Compose)
-
-Services:
-- db: postgres:16
-- redis: redis:7-alpine
-- backend: FastAPI on port 8000 (auto-reload)
-- worker: Celery worker (same image as backend)
-- frontend: Next.js on port 3000 (auto-reload)
+1. `config.py` — settings (foundation, everything depends on this)
+2. `database.py` — DB connection
+3. `models/` — table structure
+4. `alembic/` — first migration, create tables
+5. `auth/` — authentication
+6. `schemas/` — Pydantic schemas
+7. `routers/` — HTTP routes (empty stubs first)
+8. `services/form_parser/` — form parsing
+9. `services/submission/` — form submission
+10. `worker/` — Celery task
+11. `routers/` — wire in real logic
+12. `frontend/` — pages
 
 ---
 
-## 13. Phase 1 scope — build this
+## Phase 1 scope
 
-- Email/password auth (signup, login)
-- Form parsing (multiple choice, checkbox, dropdown only)
-- Response distribution config UI
+**Building:**
+- Email/password auth
+- Form parsing: multiple choice, checkbox, dropdown
+- Response distribution config
 - Job creation + Celery queue
-- Background worker with progress updates
-- Job progress page with polling
-- Dashboard with job history + re-run
+- Worker with progress tracking
+- Progress page with polling
+- Dashboard with history + re-run
 - Landing page
-- Input validation on all endpoints
-- Tests for: parser, distribution, engine
+- Tests: parser, distribution, engine
 
-## 14. Out of scope — do NOT build
-
+**NOT building:**
 - Stripe / payments
-- Email sending (stub with print/logging)
-- Short text, linear scale, date, time, grid question types
+- Email notifications
+- Short text, linear scale, date, grid question types
 - Admin panel
-- API access for external consumers
-- Email notifications on job completion
-- OAuth / social login
+- External API
