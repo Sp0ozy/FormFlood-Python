@@ -46,7 +46,7 @@ services:
 
   frontend:
     build: ./frontend
-    command: npm run dev
+    command: npm run dev -- --hostname 0.0.0.0
     ports:
       - "3000:3000"
     volumes:
